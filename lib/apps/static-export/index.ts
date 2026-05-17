@@ -30,14 +30,17 @@ import {
   buildAnchorMap,
 } from '@/lib/page-fetcher'
 import type { PageData } from '@/lib/page-fetcher'
-import { buildSlugPath } from '@/lib/page-utils'
+import { buildSlugPath, buildLocalizedSlugPath } from '@/lib/page-utils'
+import { getTranslatableKey } from '@/lib/locale-runtime'
 import { getSupabaseAdmin } from '@/lib/supabase-server'
 import { getSettingByKey } from '@/lib/repositories/settingsRepository'
 import { getAppSettingValue, setAppSetting } from '@/lib/repositories/appSettingsRepository'
 import { getValuesByFieldId } from '@/lib/repositories/collectionItemValueRepository'
+import { getTranslationsByLocale } from '@/lib/repositories/translationRepository'
+import { base62ToUuid } from '@/lib/convertion-utils'
 
 import type { ExportConfig, ExportJob, OutputTarget } from './types'
-import type { Page, PageFolder, Layer } from '@/types'
+import type { Page, PageFolder, Layer, Locale, Translation } from '@/types'
 
 export const APP_ID = 'static-export'
 
@@ -492,28 +495,45 @@ interface PageCmsSettings {
   slug_field_id?: string
 }
 
+interface LocaleContext {
+  /** Active locale (null = default). */
+  locale: Locale | null
+  /** Translations for the active locale (empty for default). */
+  translations: Record<string, Translation>
+}
+
 /**
  * Yield one resolved page per route the source page produces:
  *   - static page  → 1
- *   - error page   → 1 (at /<code>.html)
- *   - homepage     → 1 (at /index.html)
- *   - dynamic page → N, one per published collection item (skipped if the
- *     collection has no items or the CMS config is missing)
+ *   - error page   → 1 (at /<code>.html, default locale only)
+ *   - homepage     → 1 (at /index.html for default, /<code>/index.html for others)
+ *   - dynamic page → N, one per published collection item (default locale only
+ *     in this iteration — see follow-up notes for per-locale CMS expansion)
  *
  * Each resolution goes through the same fetcher the live site uses so the
  * layer tree comes back with components, collections, references, and
  * assets all resolved.
+ *
+ * When `ctx.locale` is set to a non-default locale, all output keys are
+ * prefixed with the locale code (matching the live site routing pattern).
  */
 async function* resolvePages(
   page: Page,
   folders: PageFolder[],
   pages: Page[],
+  ctx: LocaleContext,
 ): AsyncGenerator<ResolvedPage> {
-  // --- Error pages ----------------------------------------------------------
+  const isDefaultLocale = !ctx.locale || ctx.locale.is_default
+  const localePrefix = isDefaultLocale ? '' : `${ctx.locale!.code}/`
+
+  // --- Error pages (default locale only) ------------------------------------
+  // Error pages don't get per-locale variants in v1; the live site routes
+  // 404/401/500 globally regardless of locale.
   if (page.error_page !== null && page.error_page !== undefined) {
+    if (!isDefaultLocale) return
     const data = (await fetchErrorPage(page.error_page, true)) as PageData | null
     if (data) {
-      const resolved = renderResolved(data.page, data, folders, pages, `${page.error_page}.html`)
+      const resolved = renderResolved(data.page, data, folders, pages, `${page.error_page}.html`, ctx)
       if (resolved) yield resolved
     }
     return
@@ -521,16 +541,30 @@ async function* resolvePages(
 
   // --- Homepage -------------------------------------------------------------
   if (page.is_index && page.page_folder_id === null) {
-    const data = (await fetchHomepage(true)) as PageData | null
+    let data: PageData | null
+    let outputKey: string
+    if (isDefaultLocale) {
+      data = (await fetchHomepage(true)) as PageData | null
+      outputKey = 'index.html'
+    } else {
+      // The live site serves the localized homepage at `/<code>` so
+      // fetchPageByPath('<code>', …) returns the homepage with translations.
+      data = await fetchPageByPath(ctx.locale!.code, true)
+      outputKey = `${localePrefix}index.html`
+    }
     if (data) {
-      const resolved = renderResolved(data.page, data, folders, pages, 'index.html')
+      const resolved = renderResolved(data.page, data, folders, pages, outputKey, ctx)
       if (resolved) yield resolved
     }
     return
   }
 
   // --- Dynamic CMS pages ---------------------------------------------------
+  // Per-locale CMS expansion would need to fetch the translated slug of each
+  // item; deferred to a follow-up. For now, dynamic pages only export under
+  // the default locale.
   if (page.is_dynamic) {
+    if (!isDefaultLocale) return
     const cms = (page.settings as { cms?: PageCmsSettings } | undefined)?.cms
     if (!cms?.collection_id || !cms.slug_field_id) {
       console.warn(`[Static Export] Dynamic page "${page.name}" has no CMS config — skipping`)
@@ -552,17 +586,23 @@ async function* resolvePages(
         continue
       }
       const outputKey = `${slugPath}/index.html`
-      const resolved = renderResolved(data.page, data, folders, pages, outputKey)
+      const resolved = renderResolved(data.page, data, folders, pages, outputKey, ctx)
       if (resolved) yield resolved
     }
     return
   }
 
   // --- Static pages --------------------------------------------------------
-  const slugPath = buildSlugPath(page, folders, 'page').replace(/^\/+/, '')
+  const localizedPath = isDefaultLocale
+    ? buildSlugPath(page, folders, 'page')
+    : buildLocalizedSlugPath(page, folders, 'page', ctx.locale, ctx.translations)
+  const slugPath = localizedPath.replace(/^\/+/, '')
   const data = await fetchPageByPath(slugPath, true)
   if (!data?.pageLayers?.layers) return
-  const resolved = renderResolved(data.page, data, folders, pages, computeOutputKey(page, folders))
+  const outputKey = isDefaultLocale
+    ? computeOutputKey(page, folders)
+    : (slugPath ? `${slugPath}/index.html` : `${localePrefix}index.html`)
+  const resolved = renderResolved(data.page, data, folders, pages, outputKey, ctx)
   if (resolved) yield resolved
 }
 
@@ -572,15 +612,18 @@ function renderResolved(
   folders: PageFolder[],
   pages: Page[],
   outputKey: string,
+  ctx: LocaleContext,
 ): ResolvedPage | null {
   if (!data.pageLayers?.layers) return null
   const layers = data.pageLayers.layers
+  // Prefer the data's resolved locale/translations (it's authoritative for
+  // the rendered tree) and fall back to the loop-level context.
   const bodyHtml = renderPageBody(layers, {
     pages,
     folders,
     components: data.components,
-    locale: data.locale ?? null,
-    translations: data.translations,
+    locale: data.locale ?? ctx.locale ?? null,
+    translations: data.translations ?? ctx.translations,
   })
   return {
     page,
@@ -891,6 +934,143 @@ function trimGitOutput(stderr: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Locale helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the `Record<key, Translation>` shape `buildLocalizedSlugPath` expects.
+ * Key shape mirrors `getTranslatableKey` so the same lookup logic the live
+ * site uses to resolve translated slugs works here too.
+ */
+function buildTranslationsMap(translations: Translation[]): Record<string, Translation> {
+  const map: Record<string, Translation> = {}
+  for (const t of translations) {
+    const key = getTranslatableKey({
+      source_type: t.source_type,
+      source_id: t.source_id,
+      content_key: t.content_key,
+    })
+    map[key] = t
+  }
+  return map
+}
+
+// ---------------------------------------------------------------------------
+// Supabase asset bundler
+// ---------------------------------------------------------------------------
+
+/** SEO-proxy URL pattern Ycode emits for asset variables: `/a/<22-char hash>/<filename>` */
+const ASSET_PROXY_URL_RE = /\/a\/([A-Za-z0-9]{22})\/[^"'\s)<>]+/g
+const PROXY_FETCH_CONCURRENCY = 8
+
+interface SupabaseAssetClient {
+  from(table: 'assets'): {
+    select(cols: string): {
+      eq(col: string, val: unknown): {
+        eq(col: string, val: unknown): {
+          is(col: string, val: unknown): {
+            maybeSingle(): Promise<{
+              data: { id: string; filename: string; mime_type: string; public_url: string | null } | null
+              error: { message: string } | null
+            }>
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Pull Supabase-hosted asset files referenced from the rendered HTML into
+ * the output list. Each `/a/<hash>/<name>` URL is decoded back to an asset
+ * UUID, the row is looked up, the bytes are fetched from `public_url`, and
+ * the file is shipped at the same `/a/<hash>/<name>` path so the HTML
+ * doesn't need rewriting.
+ *
+ * Without this, S3-hosted exports show broken images for any user-uploaded
+ * asset because the proxy URL has no resolver on the static host.
+ */
+async function collectSupabaseAssets(htmlOutputs: OutputFile[]): Promise<OutputFile[]> {
+  // Scan all HTML output bodies for proxy URLs.
+  const proxyUrls = new Set<string>()
+  for (const f of htmlOutputs) {
+    if (typeof f.body !== 'string') continue
+    for (const m of f.body.matchAll(ASSET_PROXY_URL_RE)) {
+      proxyUrls.add(m[0])
+    }
+  }
+  if (proxyUrls.size === 0) return []
+
+  const client = (await getSupabaseAdmin()) as SupabaseAssetClient | null
+  if (!client) {
+    console.warn('[Static Export] Could not bundle Supabase assets: Supabase client unavailable')
+    return []
+  }
+
+  // Resolve each proxy URL → assetId → asset record → fetched bytes, with
+  // a small concurrency cap so big sites don't open hundreds of sockets.
+  const queue = Array.from(proxyUrls)
+  const results: OutputFile[] = []
+  let cursor = 0
+  const workers = Array.from({ length: Math.min(PROXY_FETCH_CONCURRENCY, queue.length) }, async () => {
+    while (cursor < queue.length) {
+      const proxyUrl = queue[cursor++]
+      const file = await fetchAssetByProxyUrl(client, proxyUrl)
+      if (file) results.push(file)
+    }
+  })
+  await Promise.all(workers)
+  return results
+}
+
+async function fetchAssetByProxyUrl(
+  client: SupabaseAssetClient,
+  proxyUrl: string,
+): Promise<OutputFile | null> {
+  const match = proxyUrl.match(/\/a\/([A-Za-z0-9]{22})\//)
+  if (!match) return null
+
+  let assetId: string
+  try {
+    assetId = base62ToUuid(match[1])
+  } catch {
+    return null
+  }
+
+  const { data: asset, error } = await client
+    .from('assets')
+    .select('id, filename, mime_type, public_url')
+    .eq('id', assetId)
+    .eq('is_published', true)
+    .is('deleted_at', null)
+    .maybeSingle()
+
+  if (error || !asset?.public_url) {
+    console.warn(`[Static Export] Could not look up asset for ${proxyUrl}: ${error?.message ?? 'not found'}`)
+    return null
+  }
+
+  try {
+    const response = await fetch(asset.public_url)
+    if (!response.ok) {
+      console.warn(`[Static Export] HTTP ${response.status} fetching ${asset.filename}`)
+      return null
+    }
+    const buf = Buffer.from(await response.arrayBuffer())
+    return {
+      key: proxyUrl.replace(/^\/+/, ''),
+      body: buf,
+      contentType: asset.mime_type || mediaContentType(proxyUrl),
+    }
+  } catch (err) {
+    console.warn(
+      `[Static Export] Fetch failed for ${proxyUrl}: ${err instanceof Error ? err.message : err}`,
+    )
+    return null
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Public-asset bundler (used after the page loop)
 // ---------------------------------------------------------------------------
 
@@ -963,8 +1143,8 @@ export async function exportSite(): Promise<ExportJob> {
       return job
     }
 
-    // ---- Folders + shared CSS in parallel --------------------------------
-    const [folderResult, publishedCss, colorVariablesCss] = await Promise.all([
+    // ---- Folders + shared CSS + locales in parallel ----------------------
+    const [folderResult, publishedCss, colorVariablesCss, localeResult] = await Promise.all([
       client
         .from('page_folders')
         .select('*')
@@ -972,11 +1152,22 @@ export async function exportSite(): Promise<ExportJob> {
         .order('depth', { ascending: true }),
       getSettingByKey('published_css').catch(() => null),
       getSettingByKey('color_variables_css').catch(() => null),
+      client
+        .from('locales')
+        .select('*')
+        .eq('is_published', true)
+        .is('deleted_at', null),
     ])
     if (folderResult.error) {
       throw new Error(`Failed to fetch folders: ${folderResult.error.message}`)
     }
     const folders = (folderResult.data ?? []) as PageFolder[]
+    const locales = (localeResult.data ?? []) as Locale[]
+
+    // The export always covers the default locale, plus one pass per
+    // non-default published locale (writing to `<code>/...`).
+    const defaultLocale = locales.find((l) => l.is_default) ?? null
+    const additionalLocales = locales.filter((l) => !l.is_default)
 
     if (!publishedCss) {
       console.warn(
@@ -984,14 +1175,19 @@ export async function exportSite(): Promise<ExportJob> {
       )
     }
 
-    // ---- Render every page into the OutputFile list ---------------------
+    // ---- Render every page (default locale + per non-default locale) ----
     const outputs: OutputFile[] = []
     const referencedAssetPaths = new Set<string>()
 
-    for (const page of pages) {
+    // The render closure handles one (page, locale) tuple. Reused below for
+    // the default-locale pass and once more per additional locale.
+    const renderPage = async (
+      page: Page,
+      ctx: LocaleContext,
+    ): Promise<void> => {
       let yieldedAny = false
       try {
-        for await (const resolved of resolvePages(page, folders, pages)) {
+        for await (const resolved of resolvePages(page, folders, pages, ctx)) {
           yieldedAny = true
           const html = buildDocument({
             page: resolved.page,
@@ -1003,7 +1199,7 @@ export async function exportSite(): Promise<ExportJob> {
 
           // Collect Ycode's built-in placeholder URLs referenced from this
           // page so we can ship them alongside the HTML for fully
-          // self-contained hosting on S3 or GitHub.
+          // self-contained hosting.
           for (const match of html.matchAll(/\/ycode\/layouts\/assets\/[^"'\s)]+/g)) {
             referencedAssetPaths.add(match[0])
           }
@@ -1016,25 +1212,60 @@ export async function exportSite(): Promise<ExportJob> {
           job.pagesExported++
         }
       } catch (err) {
+        const label = ctx.locale && !ctx.locale.is_default ? `[${ctx.locale.code}] ` : ''
         console.warn(
-          `[Static Export] Failed to resolve "${page.name}" (${page.id}): ${
+          `[Static Export] Failed to resolve ${label}"${page.name}" (${page.id}): ${
             err instanceof Error ? err.message : err
           }`,
         )
-        continue
+        return
       }
       if (!yieldedAny) {
-        console.warn(`[Static Export] Skipping "${page.name}" — no routes produced`)
+        // No routes is normal for some (page, locale) tuples (e.g. error
+        // pages for non-default locales). Only warn for default-locale gaps.
+        if (!ctx.locale || ctx.locale.is_default) {
+          console.warn(`[Static Export] Skipping "${page.name}" — no routes produced`)
+        }
       }
     }
 
-    // ---- Bundle referenced placeholder assets ---------------------------
+    // Default-locale pass.
+    {
+      const ctx: LocaleContext = { locale: defaultLocale, translations: {} }
+      for (const page of pages) {
+        await renderPage(page, ctx)
+      }
+    }
+
+    // One pass per additional locale.
+    for (const locale of additionalLocales) {
+      const translations = await getTranslationsByLocale(locale.id, true)
+      const translationsMap = buildTranslationsMap(translations)
+      const ctx: LocaleContext = { locale, translations: translationsMap }
+      for (const page of pages) {
+        await renderPage(page, ctx)
+      }
+    }
+
+    // ---- Bundle referenced /public placeholders -------------------------
     // Ycode templates reference images under /ycode/layouts/assets/*. These
     // live in /public on the running app — for S3 or GitHub hosting they
     // need to ship with the export so the URLs resolve.
     if (referencedAssetPaths.size > 0) {
       const assetFiles = await collectPublicAssets(Array.from(referencedAssetPaths))
       outputs.push(...assetFiles)
+    }
+
+    // ---- Bundle referenced Supabase-hosted assets -----------------------
+    // User-uploaded images, videos, and other assets are rendered with the
+    // `/a/<hash>/<filename>` proxy URL pattern. The proxy doesn't exist on
+    // S3/GitHub-hosted exports, so we resolve each URL back to its asset
+    // record and ship the file at the same path.
+    const supabaseAssetFiles = await collectSupabaseAssets(
+      outputs.filter((o) => o.key.endsWith('.html')),
+    )
+    if (supabaseAssetFiles.length > 0) {
+      outputs.push(...supabaseAssetFiles)
     }
 
     // ---- Flush to every configured target -------------------------------
