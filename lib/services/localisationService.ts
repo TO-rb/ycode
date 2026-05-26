@@ -153,7 +153,7 @@ export async function publishLocalisation(): Promise<PublishLocalisationResult> 
   const [existingPublishedLocalesRes, existingPublishedTranslations] = await Promise.all([
     client.from('locales').select('*').eq('is_published', true),
     fetchAllRows<Translation>((from, to) =>
-      client.from('translations').select('*').eq('is_published', true).range(from, to)
+      client.from('translations').select('*').eq('is_published', true).order('id', { ascending: true }).range(from, to)
     ),
   ]);
 
@@ -282,7 +282,7 @@ export async function publishLocalisation(): Promise<PublishLocalisationResult> 
   let allDraftTranslations: Translation[];
   try {
     allDraftTranslations = await fetchAllRows<Translation>((from, to) =>
-      client.from('translations').select('*').eq('is_published', false).range(from, to)
+      client.from('translations').select('*').eq('is_published', false).order('id', { ascending: true }).range(from, to)
     );
   } catch (translationsError) {
     const message = translationsError instanceof Error ? translationsError.message : String(translationsError);
