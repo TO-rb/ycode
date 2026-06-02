@@ -614,7 +614,12 @@ export async function POST(request: NextRequest) {
       // components/styles. The builder only regenerates CSS for pages open
       // in memory — pages not loaded keep stale generated_css/content_hash.
       // This ensures batchPublishPageLayers detects the real hash change.
-      if (!globalChanged && cssAffectedPageIds.length > 0) {
+      //
+      // Runs regardless of globalChanged: this is a data-publish step (it
+      // pushes style-sync-rewritten draft layers to the published version),
+      // not a cache operation. Skipping it when a global resource changed
+      // would leave those pages' published layers stale.
+      if (cssAffectedPageIds.length > 0) {
         try {
           const { generateCSSForPages } = await import('@/lib/server/cssGenerator');
           await generateCSSForPages(cssAffectedPageIds);
