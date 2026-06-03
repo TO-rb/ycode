@@ -1814,25 +1814,23 @@ const LayerItemImpl: React.FC<{
     return null;
   }
 
-  // Evaluate conditional visibility (only in edit mode - SSR handles published pages)
+  // Evaluate conditional visibility on canvas (SSR handles published pages).
+  // Collection count-based conditions (`page_collection`: has_items / has_no_items
+  // / item_count) depend on runtime/published data, so on canvas we always render
+  // those blocks — e.g. empty states — to keep them selectable and styleable.
   const conditionalVisibility = layer.variables?.conditionalVisibility;
   if (isEditMode && conditionalVisibility && conditionalVisibility.groups?.length > 0) {
-    // Build page collection counts from the store
-    const pageCollectionCounts: Record<string, number> = {};
-    conditionalVisibility.groups.forEach(group => {
-      group.conditions?.forEach(condition => {
-        if (condition.source === 'page_collection' && condition.collectionLayerId) {
-          // Use the layerData from the store for collection counts
-          const storeData = useCollectionLayerStore.getState().layerData[condition.collectionLayerId];
-          pageCollectionCounts[condition.collectionLayerId] = storeData?.length ?? 0;
-        }
-      });
-    });
+    const canvasVisibility = {
+      groups: conditionalVisibility.groups.map(group => ({
+        ...group,
+        conditions: group.conditions?.filter(c => c.source !== 'page_collection') ?? [],
+      })),
+    };
 
-    const isVisible = evaluateVisibility(conditionalVisibility, {
+    const isVisible = evaluateVisibility(canvasVisibility, {
       collectionLayerData,
       pageCollectionData: pageCollectionItemData,
-      pageCollectionCounts,
+      pageCollectionCounts: {},
       currentItemId: collectionLayerItemId,
       pageCollectionItemId,
       timezone,
