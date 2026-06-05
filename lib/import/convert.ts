@@ -55,6 +55,62 @@ export class ImportConverter {
     private readonly onProgress?: () => void,
   ) {}
 
+  /**
+   * The ordered, framework-folded style refs a node will request, lowest
+   * priority first (global underlay → base class → combo classes). This is the
+   * single source of truth for which `LayerStyle`s a node maps to: both the
+   * bulk style pre-pass ({@link collectStyleRefs}) and `resolveStyling` call it,
+   * so the two paths can never drift and create different styles.
+   */
+  private orderedStyleRefs(node: ImportNode): ImportStyleRef[] {
+    const underlay = node.underlayStyles ?? [];
+    const refs = node.styles ?? [];
+    const framework = node.frameworkClasses ?? [];
+
+    const base = refs.length > 0 ? (refs.find((r) => !r.combo) ?? refs[0]) : undefined;
+    const combos = base ? refs.filter((r) => r !== base) : [];
+    const orderedNamed: { ref: ImportStyleRef; foldsFramework: boolean }[] = [];
+    for (const u of underlay) orderedNamed.push({ ref: u, foldsFramework: false });
+    if (base) {
+      orderedNamed.push({ ref: base, foldsFramework: true });
+      for (const c of combos) orderedNamed.push({ ref: c, foldsFramework: false });
+    }
+    // With no base class to absorb them, fold the shims into the lowest named
+    // (underlay) style so they persist when the stack is later re-resolved.
+    if (!base && framework.length > 0 && orderedNamed.length > 0) {
+      orderedNamed[0].foldsFramework = true;
+    }
+
+    return orderedNamed.map(({ ref, foldsFramework }) => {
+      const classes = foldsFramework && framework.length > 0
+        ? mergeClassStack([...framework, ...ref.classes])
+        : mergeClassStack(ref.classes);
+      return {
+        // Fold framework into the style's identity so a base reused with
+        // different widget defaults doesn't collapse onto the wrong style.
+        key: foldsFramework && framework.length > 0 ? `fw:${framework.join('+')}|${ref.key}` : ref.key,
+        name: ref.name,
+        classes,
+      };
+    });
+  }
+
+  /**
+   * Walk the tree and gather every style ref that conversion will request, so
+   * the materializer can bulk-create them up front in one round-trip.
+   */
+  collectStyleRefs(nodes: ImportNode[]): ImportStyleRef[] {
+    const out: ImportStyleRef[] = [];
+    const walk = (list: ImportNode[]) => {
+      for (const node of list) {
+        out.push(...this.orderedStyleRefs(node));
+        if (node.children) walk(node.children);
+      }
+    };
+    walk(nodes);
+    return out;
+  }
+
   /** Convert a list of root nodes into Ycode layers. */
   async convertNodes(nodes: ImportNode[]): Promise<Layer[]> {
     const layers: Layer[] = [];
@@ -108,41 +164,18 @@ export class ImportConverter {
     // fill gaps without becoming a standalone style.
     const framework = node.frameworkClasses ?? [];
 
-    // Ordered named styles, lowest priority first: global underlay (tag/body)
-    // styles, then the base class, then combo classes. Combo/later classes win,
-    // matching Webflow precedence and Tailwind's last-wins resolution.
-    const base = refs.length > 0 ? (refs.find((r) => !r.combo) ?? refs[0]) : undefined;
-    const combos = base ? refs.filter((r) => r !== base) : [];
-    const orderedNamed: { ref: ImportStyleRef; foldsFramework: boolean }[] = [];
-    for (const u of underlay) orderedNamed.push({ ref: u, foldsFramework: false });
-    if (base) {
-      orderedNamed.push({ ref: base, foldsFramework: true });
-      for (const c of combos) orderedNamed.push({ ref: c, foldsFramework: false });
-    }
-    // With no base class to absorb them, fold the shims into the lowest named
-    // (underlay) style so they persist when the stack is later re-resolved.
-    if (!base && framework.length > 0 && orderedNamed.length > 0) {
-      orderedNamed[0].foldsFramework = true;
-    }
+    // Ordered named styles, lowest priority first (global underlay → base class
+    // → combo classes). Built by the shared helper so it matches the bulk
+    // pre-pass exactly; the materializer has already created these, so each
+    // getOrCreateStyle resolves from cache with no network call.
+    const orderedRefs = this.orderedStyleRefs(node);
 
     const styleIds: string[] = [];
     const stackClasses: string[] = [];
     let topStyleId: string | undefined;
     let topStyleClasses = '';
 
-    for (const { ref, foldsFramework } of orderedNamed) {
-      const classes = foldsFramework && framework.length > 0
-        ? mergeClassStack([...framework, ...ref.classes])
-        : mergeClassStack(ref.classes);
-
-      const styleRef: ImportStyleRef = {
-        // Fold framework into the style's identity so a base reused with
-        // different widget defaults doesn't collapse onto the wrong style.
-        key: foldsFramework && framework.length > 0 ? `fw:${framework.join('+')}|${ref.key}` : ref.key,
-        name: ref.name,
-        classes,
-      };
-
+    for (const styleRef of orderedRefs) {
       const style = await this.mat.getOrCreateStyle(styleRef);
       if (style) {
         styleIds.push(style.id);
@@ -152,7 +185,7 @@ export class ImportConverter {
       } else {
         // Empty/failed (e.g. a declaration-less combo): inline its classes so
         // nothing is lost, but don't create a style reference for it.
-        stackClasses.push(...classes);
+        stackClasses.push(...styleRef.classes);
       }
     }
 

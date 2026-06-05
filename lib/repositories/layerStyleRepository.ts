@@ -5,6 +5,7 @@
  * Supports draft/published workflow with content hash-based change detection
  */
 
+import { randomUUID } from 'crypto';
 import { getSupabaseAdmin } from '@/lib/supabase-server';
 import type { LayerStyle, Layer, ComponentVariant } from '@/types';
 import {
@@ -159,6 +160,59 @@ export async function createStyle(
   }
 
   return data;
+}
+
+/**
+ * Create many layer styles in a single round-trip (draft versions).
+ *
+ * Used by the import pipeline so a paste with dozens of new combo/global styles
+ * costs one INSERT instead of one HTTP request per style — the dominant source
+ * of paste latency on serverless (each request pays cold-start + middleware +
+ * network RTT). IDs are generated here so the returned rows can be re-ordered to
+ * exactly match the input order, since the DB doesn't guarantee row order on a
+ * bulk insert + select.
+ */
+export async function createStyles(
+  stylesData: CreateLayerStyleData[]
+): Promise<LayerStyle[]> {
+  if (stylesData.length === 0) {
+    return [];
+  }
+
+  const client = await getSupabaseAdmin();
+  if (!client) {
+    throw new Error('Failed to initialize Supabase client');
+  }
+
+  const rows = stylesData.map((styleData) => ({
+    id: randomUUID(),
+    name: styleData.name,
+    classes: styleData.classes,
+    design: styleData.design,
+    group: styleData.group,
+    content_hash: generateLayerStyleContentHash({
+      name: styleData.name,
+      classes: styleData.classes,
+      design: styleData.design,
+    }),
+    is_published: false,
+  }));
+
+  const { data, error } = await client
+    .from('layer_styles')
+    .insert(rows)
+    .select();
+
+  if (error) {
+    throw new Error(`Failed to create layer styles: ${error.message}`);
+  }
+
+  // Re-order to match the input: the caller maps results back to its refs by
+  // index, so the order must be deterministic regardless of DB return order.
+  const byId = new Map<string, LayerStyle>((data || []).map((d) => [d.id, d]));
+  return rows
+    .map((r) => byId.get(r.id))
+    .filter((s): s is LayerStyle => Boolean(s));
 }
 
 /**

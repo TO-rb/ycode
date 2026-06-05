@@ -25,7 +25,7 @@ import { useFontsStore } from '@/stores/useFontsStore';
 import { YCODE_FIGMA_SIGNATURE, isYcodeFigmaPayload } from '@/lib/figma/types';
 import type { YcodeFigmaPayload } from '@/lib/figma/types';
 import { loadSiteStylesheetCss } from '@/lib/apps/webflow/stylesheet-cache';
-import { buildImport } from '@/lib/import';
+import { buildImport, type ImportProgress } from '@/lib/import';
 import { isWebflowClipboard, parseWebflowClipboard } from '@/lib/import/adapters/webflow';
 import { parseGlobalStylesheet } from '@/lib/import/adapters/webflow/global-styles';
 import { plural } from '@/lib/import/summary';
@@ -201,17 +201,27 @@ export function useImportPaste({
         return;
       }
 
-      // Stream "n of total layers" into the loading toast, throttled so large
-      // pastes don't re-render on every node.
+      // Stream phase progress (styles → images → layers) into the loading
+      // toast, throttled so large pastes don't re-render on every node. The
+      // first/last event of each phase always paints so the label switches
+      // promptly.
       let lastProgressAt = 0;
-      const onProgress = (done: number, total: number) => {
+      const onProgress = (progress: ImportProgress) => {
         const now = performance.now();
-        if (done < total && now - lastProgressAt < 80) return;
+        const boundary = progress.done === 0 || progress.done >= progress.total;
+        if (!boundary && now - lastProgressAt < 80) return;
         lastProgressAt = now;
-        toast.loading('Pasting from Webflow…', {
-          id: toastId,
-          description: `Building layer ${done} of ${total}`,
-        });
+
+        let description: string;
+        if (progress.phase === 'styles') {
+          description = 'Creating styles…';
+        } else if (progress.phase === 'images') {
+          description = `Uploading images ${progress.done} of ${progress.total}`;
+        } else {
+          description = `Building layer ${progress.done} of ${progress.total}`;
+        }
+
+        toast.loading('Pasting from Webflow…', { id: toastId, description });
       };
 
       const { layers, summary } = await buildImport(document, { onProgress });

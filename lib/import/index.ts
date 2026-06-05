@@ -12,7 +12,7 @@ import { ImportConverter } from '@/lib/import/convert';
 import { componentizeLayers } from '@/lib/import/componentize';
 import { useFontsStore } from '@/stores/useFontsStore';
 import type { Layer } from '@/types';
-import type { ImportDocument, ImportSummary } from '@/lib/import/types';
+import type { ImportDocument, ImportNode, ImportSummary } from '@/lib/import/types';
 
 function countLayers(layers: { children?: unknown[] }[]): number {
   let total = 0;
@@ -43,7 +43,7 @@ export interface ImportResult {
   summary: ImportSummary;
 }
 
-/** Total nodes in the source tree — the denominator for paste progress. */
+/** Total nodes in the source tree — the denominator for the layers phase. */
 function countNodes(nodes: { children?: unknown[] }[]): number {
   let total = 0;
   const walk = (list: { children?: unknown[] }[]) => {
@@ -56,9 +56,34 @@ function countNodes(nodes: { children?: unknown[] }[]): number {
   return total;
 }
 
+/** Unique remote image URLs that need re-hosting (skips pre-uploaded assets). */
+function collectImageUrls(nodes: ImportNode[]): string[] {
+  const urls = new Set<string>();
+  const walk = (list: ImportNode[]) => {
+    for (const node of list) {
+      if (node.kind === 'image' && node.image?.src && !node.image.assetId) {
+        urls.add(node.image.src);
+      }
+      if (node.children) walk(node.children);
+    }
+  };
+  walk(nodes);
+  return [...urls];
+}
+
+/** The work phase a paste is currently in, in execution order. */
+export type ImportPhase = 'styles' | 'images' | 'layers';
+
+/** Progress for the active phase (`done` of `total`). */
+export interface ImportProgress {
+  phase: ImportPhase;
+  done: number;
+  total: number;
+}
+
 export interface BuildImportOptions {
-  /** Reports converted-node progress (`done` of `total`) for a UI indicator. */
-  onProgress?: (done: number, total: number) => void;
+  /** Reports phase-based progress (styles → images → layers) for a UI indicator. */
+  onProgress?: (progress: ImportProgress) => void;
 }
 
 /**
@@ -71,6 +96,7 @@ export async function buildImport(
   options: BuildImportOptions = {},
 ): Promise<ImportResult> {
   const mat = new ImportMaterializer(document.source);
+  const report = options.onProgress;
 
   // Install referenced fonts up front (best-effort; needs the catalog loaded).
   if (document.fonts && document.fonts.length > 0) {
@@ -78,12 +104,34 @@ export async function buildImport(
     await Promise.all(document.fonts.map((f) => mat.installFont(f.family)));
   }
 
-  const total = countNodes(document.roots);
-  let done = 0;
+  const totalNodes = countNodes(document.roots);
+  let nodeDone = 0;
   const converter = new ImportConverter(mat, () => {
-    done += 1;
-    options.onProgress?.(done, total);
+    nodeDone += 1;
+    report?.({ phase: 'layers', done: nodeDone, total: totalNodes });
   });
+
+  // Phase 1 — styles: bulk-create every style in one round-trip (the slow step
+  // on serverless), priming the cache so conversion needs no per-style request.
+  const styleRefs = converter.collectStyleRefs(document.roots);
+  report?.({ phase: 'styles', done: 0, total: 1 });
+  await mat.prepareStyles(styleRefs);
+  report?.({ phase: 'styles', done: 1, total: 1 });
+
+  // Phase 2 — images: re-host every referenced image in parallel.
+  const imageUrls = collectImageUrls(document.roots);
+  if (imageUrls.length > 0) {
+    let imageDone = 0;
+    report?.({ phase: 'images', done: 0, total: imageUrls.length });
+    await mat.prepareAssets(imageUrls, () => {
+      imageDone += 1;
+      report?.({ phase: 'images', done: imageDone, total: imageUrls.length });
+    });
+  }
+
+  // Phase 3 — layers: build the tree. Styles/assets are cached, so this is now
+  // CPU-bound and fast; the converter ticks per node for the indicator.
+  report?.({ phase: 'layers', done: 0, total: totalNodes });
   let layers = await converter.convertNodes(document.roots);
   layers = await componentizeLayers(layers, mat);
 

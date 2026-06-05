@@ -101,6 +101,97 @@ export class ImportMaterializer {
     return promise;
   }
 
+  /**
+   * Pre-create every new style a paste needs in ONE bulk request, priming the
+   * per-key cache so the subsequent conversion resolves styles from memory with
+   * no further network calls. This collapses the dominant paste cost on
+   * serverless — one POST per style — into a single round-trip.
+   *
+   * Dedup mirrors {@link getOrCreateStyle} exactly: by the ref's stable key,
+   * then by name + content (reusing existing styles and collapsing duplicate
+   * content within the batch), so the bulk path produces an identical style set
+   * to the per-node path.
+   */
+  async prepareStyles(refs: ImportStyleRef[]): Promise<void> {
+    // Styles to actually create, deduped by content; `contentToIndex` maps a
+    // content key to its slot in `toCreate`, `keyToContent` maps every ref key
+    // that should resolve to that new style.
+    const toCreate: { name: string; classes: string; design: Layer['design'] }[] = [];
+    const contentToIndex = new Map<string, number>();
+    const keyToContent = new Map<string, string>();
+    const keyToExisting = new Map<string, LayerStyle>();
+
+    for (const ref of refs) {
+      if (this.styleCache.has(ref.key)) continue;
+
+      const classes = ref.classes.join(' ').trim();
+      if (!classes) continue; // declaration-less: handled inline by the converter
+
+      const name = ref.name || 'Imported';
+      const cKey = contentKey(name, classes);
+
+      // Reuse a style that already exists (from a prior paste or this app).
+      const existing = this.stylesByContent.get(cKey);
+      if (existing) {
+        keyToExisting.set(ref.key, existing);
+        continue;
+      }
+
+      // Collapse duplicate content within this batch onto one creation.
+      if (contentToIndex.has(cKey)) {
+        keyToContent.set(ref.key, cKey);
+        continue;
+      }
+
+      const index = toCreate.length;
+      toCreate.push({ name: this.uniqueStyleName(name), classes, design: buildDesign(classes) });
+      contentToIndex.set(cKey, index);
+      keyToContent.set(ref.key, cKey);
+    }
+
+    // Prime the cache for reused existing styles (no network needed).
+    for (const [key, style] of keyToExisting) {
+      this.styleCache.set(key, Promise.resolve(style));
+    }
+
+    if (toCreate.length === 0) return;
+
+    const created = await useLayerStylesStore.getState().createStyles(toCreate);
+
+    // Register each created style under its created identity for cross-paste
+    // reuse, and bump the styles counter.
+    created.forEach((style) => {
+      if (!style) return;
+      this.counts.styles += 1;
+      this.stylesByContent.set(contentKey(style.name, style.classes), style);
+    });
+
+    // Wire every ref key to its created style, and register the requested-name
+    // content key so a later ref with the same name+content reuses it too.
+    for (const [key, cKey] of keyToContent) {
+      const index = contentToIndex.get(cKey);
+      if (index === undefined) continue;
+      const style = created[index];
+      if (!style) continue;
+      this.styleCache.set(key, Promise.resolve(style));
+      this.stylesByContent.set(cKey, style);
+    }
+  }
+
+  /**
+   * Re-host every referenced image in parallel, priming the asset cache so the
+   * conversion's `uploadAsset` calls resolve instantly. `onUploaded` fires once
+   * per finished image to drive a "k of N" progress indicator.
+   */
+  async prepareAssets(urls: string[], onUploaded?: () => void): Promise<void> {
+    await Promise.all(
+      urls.map(async (url) => {
+        await this.uploadAsset(url);
+        onUploaded?.();
+      }),
+    );
+  }
+
   /** Re-host a remote image and return its Ycode asset id (null on failure). */
   uploadAsset(url: string): Promise<string | null> {
     const cached = this.assetCache.get(url);
